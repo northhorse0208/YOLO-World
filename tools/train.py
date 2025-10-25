@@ -101,7 +101,7 @@ def main():
         cfg.load_from = args.resume
 
     # Determine whether the custom metainfo fields are all lowercase
-    is_metainfo_lower(cfg)
+    is_metainfo_lower(cfg)#is_metainfo_lower(cfg) 这个函数就会遍历你的 cfg 对象，找到所有 metainfo 字典，然后检查里面的 'classes' 和 'palette' 这些键名是不是全小写。
 
     # build the runner from config
     if 'runner_type' not in cfg:

@@ -77,30 +77,32 @@ obj365v1_train_dataset = dict(
     type='MultiModalDataset',
     dataset=dict(
         type='YOLOv5Objects365V1Dataset',
-        data_root='data/objects365v1/',
-        ann_file='annotations/objects365_train.json',
-        data_prefix=dict(img='train/'),
+        data_root='../../datasets/Objects365v1/object365v1_sampled/sampling_ratio_0.001',
+        ann_file='annotations/objects365_train_sampled_0.10%.json',
+        data_prefix=dict(img='images/'),
         filter_cfg=dict(filter_empty_gt=False, min_size=32)),
     class_text_path='data/texts/obj365v1_class_texts.json',
     pipeline=train_pipeline)
 
 mg_train_dataset = dict(type='YOLOv5MixedGroundingDataset',
-                        data_root='data/mixed_grounding/',
-                        ann_file='annotations/final_mixed_train_no_coco.json',
-                        data_prefix=dict(img='gqa/images/'),
+                        data_root='../../../dataset/GQA/gqa_sampled/sampling_ratio_0.001/',
+                        ann_file='annotations/final_mixed_train_no_coco_sampled_0.10%.json',
+                        data_prefix=dict(img='images/'),
                         filter_cfg=dict(filter_empty_gt=False, min_size=32),
                         pipeline=train_pipeline)
 
 flickr_train_dataset = dict(
     type='YOLOv5MixedGroundingDataset',
-    data_root='data/flickr/',
-    ann_file='annotations/final_flickr_separateGT_train.json',
-    data_prefix=dict(img='full_images/'),
+    data_root='../../../dataset/flickr 30k/flickr_sampled/sampling_ratio_0.001/',
+    ann_file='annotations/final_flickr_separateGT_train_sampled_0.10%.json',
+    data_prefix=dict(img='images/'),
     filter_cfg=dict(filter_empty_gt=True, min_size=32),
     pipeline=train_pipeline)
 
 train_dataloader = dict(batch_size=train_batch_size_per_gpu,
-                        collate_fn=dict(type='yolow_collate'),
+                        collate_fn=dict(type='yolow_collate'),#下面两项是debug的时候需要的,正式训练删掉
+                        num_workers=0,
+                        persistent_workers=False,
                         dataset=dict(_delete_=True,
                                      type='ConcatDataset',
                                      datasets=[
@@ -120,18 +122,20 @@ coco_val_dataset = dict(
     _delete_=True,
     type='MultiModalDataset',
     dataset=dict(type='YOLOv5LVISV1Dataset',
-                 data_root='data/coco/',
+                 data_root='../../../dataset/coco/',
                  test_mode=True,
-                 ann_file='lvis/lvis_v1_val.json',
-                 data_prefix=dict(img=''),
+                 ann_file='annotations/lvis_v1_val.json',
+                 data_prefix=dict(img='images/'),
                  batch_shapes_cfg=None),
     class_text_path='data/texts/lvis_v1_class_texts.json',
     pipeline=test_pipeline)
-val_dataloader = dict(dataset=coco_val_dataset)
+val_dataloader = dict(dataset=coco_val_dataset, #下面两项是debug的时候需要的,正式训练删掉
+                      num_workers=0,
+                      persistent_workers=False)
 test_dataloader = val_dataloader
 
 val_evaluator = dict(type='mmdet.LVISMetric',
-                     ann_file='data/coco/lvis/lvis_v1_val.json',
+                     ann_file='../../../dataset/coco/annotations/lvis_v1_val.json',
                      metric='bbox')
 test_evaluator = val_evaluator
 
@@ -151,7 +155,7 @@ custom_hooks = [
          switch_pipeline=train_pipeline_stage2)
 ]
 train_cfg = dict(max_epochs=max_epochs,
-                 val_interval=10,
+                 val_interval=1,
                  dynamic_intervals=[((max_epochs - close_mosaic_epochs),
                                      _base_.val_interval_stage2)])
 optim_wrapper = dict(optimizer=dict(
