@@ -53,7 +53,8 @@ class YOLOWDetDataPreprocessor(DetDataPreprocessor):
         data_samples_output = {
             'bboxes_labels': data_samples['bboxes_labels'],
             'texts': data_samples['texts'],
-            'img_metas': img_metas
+            'img_metas': img_metas,
+            'visual_masks' : data_samples['visual_masks']
         }
         if 'masks' in data_samples:
             data_samples_output['masks'] = data_samples['masks']

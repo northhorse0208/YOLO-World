@@ -226,7 +226,10 @@ class MultiModalYOLOBackbone(BaseModule):
                 text: List[List[str]]) -> Tuple[Tuple[Tensor], Tensor]:
         img_feats = self.image_model(image)
         if text is not None and self.with_text_model:
-            txt_feats = self.text_model(text)
+            if isinstance(text[0], Tensor): #这里使用缓存的
+                txt_feats = (torch.stack(text, dim=0), None)
+            else:
+                txt_feats = self.text_model(text)
             return img_feats, txt_feats
         else:
             return img_feats, None

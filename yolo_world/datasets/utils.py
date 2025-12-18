@@ -17,6 +17,7 @@ def yolow_collate(data_batch: Sequence,
     batch_imgs = []
     batch_bboxes_labels = []
     batch_masks = []
+    batch_visual_masks = []
     for i in range(len(data_batch)):
         datasamples = data_batch[i]['data_samples']
         inputs = data_batch[i]['inputs']
@@ -28,6 +29,11 @@ def yolow_collate(data_batch: Sequence,
             masks = datasamples.gt_instances.masks.to(
                 dtype=torch.bool, device=gt_bboxes.device)
             batch_masks.append(masks)
+
+        if hasattr(datasamples, 'visual_masks'):
+            batch_visual_masks.append(datasamples.visual_masks)
+        elif hasattr(datasamples, 'metainfo') and 'visual_masks' in datasamples.metainfo:
+            batch_visual_masks.append(datasamples.metainfo['visual_masks'])
         batch_idx = gt_labels.new_full((len(gt_labels), 1), i)
         bboxes_labels = torch.cat((batch_idx, gt_labels[:, None], gt_bboxes),
                                   dim=1)
@@ -40,6 +46,9 @@ def yolow_collate(data_batch: Sequence,
     }
     if len(batch_masks) > 0:
         collated_results['data_samples']['masks'] = torch.cat(batch_masks, 0)
+
+    if len(batch_visual_masks) > 0:
+        collated_results['data_samples']['visual_masks'] = torch.nn.utils.rnn.pad_sequence(batch_visual_masks, batch_first=True)
 
     if use_ms_training:
         collated_results['inputs'] = batch_imgs

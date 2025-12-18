@@ -22,6 +22,10 @@ from mmyolo.registry import MODELS
 from mmyolo.models.dense_heads import YOLOv8HeadModule, YOLOv8Head
 from mmyolo.models.utils import gt_instances_preprocess
 from mmcv.cnn.bricks import build_norm_layer
+from mmcv.ops import MultiScaleDeformableAttention
+from mmengine.model.weight_init import constant_init, xavier_init
+
+
 
 
 @MODELS.register_module()
@@ -170,6 +174,9 @@ class YOLOWorldHeadModule(YOLOv8HeadModule):
         self.cls_preds = nn.ModuleList()
         self.reg_preds = nn.ModuleList()
         self.cls_contrasts = nn.ModuleList()
+        #self.savpe = SAVPE(in_channels=[256, 512, 512], hidden_channels=256, embed_dims=512)
+        self.savpe = DeformablePromptEncoder()
+        self.opr_fusion = OrthogonalFusionModule(embed_dims=self.embed_dims)
 
         reg_out_channels = max(
             (16, self.in_channels[0] // 4, self.reg_max * 4))
@@ -243,15 +250,128 @@ class YOLOWorldHeadModule(YOLOv8HeadModule):
         if self.freeze_all:
             self._freeze_all()
 
+    # def forward(self, img_feats: Tuple[Tensor], txt_feats: Tensor,
+    #             txt_masks: Tensor, visual_masks: Tensor, bboxes_labels: Tensor) -> Tuple[List]:
+    #     """Forward features from the upstream network."""
+    #     assert len(img_feats) == self.num_levels
+    #     if visual_masks.shape[-1] == 80:
+    #         visual_embeds = self.savpe(img_feats, visual_masks)
+    #     elif visual_masks.shape[-1] == 512:
+    #         visual_embeds = visual_masks
+    #     else:
+    #         raise ValueError("shape cuo wu")
+    #     txt_feats = visual_embeds
+    #     txt_feats = [txt_feats for _ in range(self.num_levels)]
+    #     txt_masks = [txt_masks for _ in range(self.num_levels)]
+    #     return multi_apply(self.forward_single, img_feats, txt_feats,
+    #                        txt_masks, self.cls_preds, self.reg_preds,
+    #                        self.cls_contrasts)
+
     def forward(self, img_feats: Tuple[Tensor], txt_feats: Tensor,
-                txt_masks: Tensor) -> Tuple[List]:
-        """Forward features from the upstream network."""
+                txt_masks: Tensor, visual_masks: Tensor,
+                bboxes_labels: Tensor) -> Tuple[List]:
+        """
+        Forward features with Orthogonal Fusion guided by Bbox Labels.
+        Args:
+            img_feats: FPN Features
+            txt_feats: (B, 80, 512)
+            txt_masks: 用于 loss
+            visual_masks: (B, N, H, W)
+            bboxes_labels: (M, 6) -> [batch_idx, cls_id, x1, y1, x2, y2]
+                           这是 batch 中所有图片的 GT 拼接在一起的张量
+        """
         assert len(img_feats) == self.num_levels
-        txt_feats = [txt_feats for _ in range(self.num_levels)]
-        txt_masks = [txt_masks for _ in range(self.num_levels)]
-        return multi_apply(self.forward_single, img_feats, txt_feats,
-                           txt_masks, self.cls_preds, self.reg_preds,
-                           self.cls_contrasts)
+
+        # 1. 提取视觉 Embeddings
+        # visual_embeds: (B, N, 512)
+        if visual_masks.shape[-1] == 80:
+            visual_embeds = self.savpe(img_feats, visual_masks)
+        elif visual_masks.shape[-1] == 512:
+            visual_embeds = visual_masks
+        else:
+            raise ValueError('shape fault')
+
+        # 2. 交互与融合
+        fused_txt_feats = txt_feats.clone()
+        B = txt_feats.shape[0]
+        align_loss = torch.tensor(0.0, device=txt_feats.device)
+        num_valid_samples = 0  # 用于平均 loss
+
+        # 解析 bboxes_labels 以获取每张图的正类别数量 K
+        # bboxes_labels[:, 0] 是 batch index
+        # bboxes_labels[:, 1] 是 class id
+
+        batch_indices = bboxes_labels[:, 0].long()
+        class_ids = bboxes_labels[:, 1].long()
+
+        for i in range(B):
+            # 找出当前图片 (batch_idx == i) 的所有 class_ids
+            current_img_mask = (batch_indices == i)
+
+            if not current_img_mask.any():
+                # 如果这张图没有 GT (也就是全是负样本)，直接跳过融合
+                continue
+
+            current_classes = class_ids[current_img_mask]
+
+            # 去重并排序，因为 text_feats 和 visual_embeds 应该是按类别顺序排列的唯一集合
+            # unique() 会自动排序，这很重要！确保和 Pipeline 中的逻辑一致
+            unique_classes = torch.unique(current_classes)
+
+            # K 就是当前图的正类别数量
+            K = len(unique_classes)
+
+            # 理论上 K 应该等于 visual_embeds 的有效长度，也等于 txt_feats 中前 K 个正样本
+            # 做一个防御性编程，防止 K 超过了 txt_feats 的总容量 (80)
+            K = min(K, txt_feats.shape[1])
+
+            if K == 0:
+                continue
+
+            # # 取出对应的特征
+            # vis_k = visual_embeds[i, :K, :]
+            # txt_k = txt_feats[i, :K, :]
+            # # [新增] 计算对齐损失: 1 - cosine_similarity
+            # # dim=-1 计算向量间的相似度
+            # sim = F.cosine_similarity(vis_k, txt_k, dim=-1)  # (K,)
+            # # loss = 1 - sim (范围 0~2, 越小越好)
+            # align_loss += (1.0 - sim).sum()
+            # num_valid_samples += K
+            #
+            # # --- OPR 融合 ---
+            # fused_k = self.opr_fusion(txt_k, vis_k)
+            #
+            # # 填回
+            # fused_txt_feats[i, :K, :] = fused_k
+
+            # 取出对应的特征
+            vis_k = visual_embeds[i, :K, :]
+            txt_k = txt_feats[i, :K, :]
+
+            # --- OPR 融合 ---
+            # 注意：这里接收两个返回值
+            fused_k, v_proj_k = self.opr_fusion(txt_k, vis_k)
+
+            # [修正] 计算对齐损失
+            # 现在我们计算的是 "映射后的视觉特征" 与 "文本特征" 的距离
+            # 这才真正约束了 Adapter 的学习方向
+            sim = F.cosine_similarity(v_proj_k, txt_k, dim=-1)
+            align_loss += (1.0 - sim).sum()
+            num_valid_samples += K
+
+            # 填回
+            fused_txt_feats[i, :K, :] = fused_k
+
+            # 平均 Loss
+        if num_valid_samples > 0:
+            align_loss = align_loss / num_valid_samples
+        # 3. 后续处理
+        txt_feats_list = [fused_txt_feats for _ in range(self.num_levels)]
+        txt_masks_list = [txt_masks for _ in range(self.num_levels)]
+
+        return multi_apply(self.forward_single, img_feats, txt_feats_list,
+                           txt_masks_list, self.cls_preds, self.reg_preds,
+                           self.cls_contrasts), align_loss
 
     def forward_single(self, img_feat: Tensor, txt_feat: Tensor,
                        txt_masks: Tensor, cls_pred: nn.ModuleList,
@@ -354,16 +474,22 @@ class YOLOWorldHead(YOLOv8Head):
 
     """YOLO World v8 head."""
 
+    def set_visual_prototypes(self, embeddings):
+        """Set custom prototypes (e.g. visual embeddings from LVIS) for inference."""
+        self.custom_prototypes = embeddings.detach()
+
     def loss(self, img_feats: Tuple[Tensor], txt_feats: Tensor,
              txt_masks: Tensor, batch_data_samples: Union[list, dict]) -> dict:
         """Perform forward propagation and loss calculation of the detection
         head on the features of the upstream network."""
 
-        outs = self(img_feats, txt_feats, txt_masks)
+        #outs = self(img_feats, txt_feats, txt_masks)
+        outs, align_loss = self(img_feats, txt_feats, txt_masks, batch_data_samples['visual_masks'], batch_data_samples['bboxes_labels'])
         # Fast version
         loss_inputs = outs + (txt_masks, batch_data_samples['bboxes_labels'],
                               batch_data_samples['img_metas'])
         losses = self.loss_by_feat(*loss_inputs)
+        losses['loss_align'] = align_loss * 1.0
 
         return losses
 
@@ -394,9 +520,9 @@ class YOLOWorldHead(YOLOv8Head):
         return losses, predictions
 
     def forward(self, img_feats: Tuple[Tensor], txt_feats: Tensor,
-                txt_masks: Tensor) -> Tuple[List]:
+                txt_masks: Tensor, visual_masks: Tensor, bbox_labels: Tensor) -> Tuple[List]:
         """Forward features from the upstream network."""
-        return self.head_module(img_feats, txt_feats, txt_masks)
+        return self.head_module(img_feats, txt_feats, txt_masks, visual_masks, bbox_labels)
 
     def predict(self,
                 img_feats: Tuple[Tensor],
@@ -407,10 +533,16 @@ class YOLOWorldHead(YOLOv8Head):
         """Perform forward propagation of the detection head and predict
         detection results on the features of the upstream network.
         """
+        
+        col_0 = torch.zeros(1203)
+        col_1 = torch.arange(1203)
+        val_imitate_bbox_labels = torch.stack((col_0, col_1), dim=1)
+        val_imitate_bbox_labels = val_imitate_bbox_labels.to('cuda')
+        
         batch_img_metas = [
             data_samples.metainfo for data_samples in batch_data_samples
         ]
-        outs = self(img_feats, txt_feats, txt_masks)
+        outs, _ = self(img_feats, txt_feats, txt_masks, self.custom_prototypes, val_imitate_bbox_labels)
         predictions = self.predict_by_feat(*outs,
                                            batch_img_metas=batch_img_metas,
                                            rescale=rescale)
@@ -484,10 +616,11 @@ class YOLOWorldHead(YOLOv8Head):
         gt_bboxes = gt_info[:, :, 1:]  # xyxy
         pad_bbox_flag = (gt_bboxes.sum(-1, keepdim=True) > 0).float()
 
+        num_curr_classes = cls_scores[0].shape[1]
         # pred info
         flatten_cls_preds = [
             cls_pred.permute(0, 2, 3, 1).reshape(num_imgs, -1,
-                                                 self.num_classes)
+                                                 num_curr_classes)
             for cls_pred in cls_scores
         ]
         flatten_pred_bboxes = [
@@ -507,6 +640,8 @@ class YOLOWorldHead(YOLOv8Head):
             self.flatten_priors_train[..., :2], flatten_pred_bboxes,
             self.stride_tensor[..., 0])
 
+        if hasattr(self.assigner, 'num_classes'):
+            self.assigner.num_classes = num_curr_classes
         assigned_result = self.assigner(
             (flatten_pred_bboxes.detach()).type(gt_bboxes.dtype),
             flatten_cls_preds.detach().sigmoid(), self.flatten_priors_train,
@@ -747,3 +882,465 @@ class YOLOWorldHead(YOLOv8Head):
 
             results_list.append(results)
         return results_list
+
+
+class SAVPE(BaseModule):
+    def __init__(self,
+                 in_channels,
+                 hidden_channels,
+                 embed_dims,
+                 c_internal=16,
+                 norm_cfg=dict(type='BN', requires_grad=True),
+                 act_cfg=dict(type='SiLU', inplace=True),
+                 init_cfg=None):
+        super().__init__(init_cfg)
+        self.c = c_internal
+
+        conv_cfg = dict(norm_cfg=norm_cfg, act_cfg=act_cfg)
+
+        self.cv1 = nn.ModuleList()
+        for ch in in_channels:
+            layers = [
+                ConvModule(ch, hidden_channels, 3, padding=1, **conv_cfg),
+                ConvModule(hidden_channels, hidden_channels, 3, padding=1, **conv_cfg)
+            ]
+            self.cv1.append(nn.Sequential(*layers))
+
+        # 为 P4 (index 1) 和 P5 (index 2) 添加上采样，使其与 P3 对齐
+        self.cv1[1].add_module('upsample', nn.Upsample(scale_factor=2, mode='nearest'))
+        self.cv1[2].add_module('upsample', nn.Upsample(scale_factor=4, mode='nearest'))
+
+        # 2. 构建 cv2 分支 (用于提取 Shallow/Spatial Features)
+        # 原逻辑: [Conv(x, c3, 1)] + Upsample
+        self.cv2 = nn.ModuleList()
+        for ch in in_channels:
+            layers = [
+                ConvModule(ch, hidden_channels, 1, **conv_cfg)  # 1x1 Conv
+            ]
+            self.cv2.append(nn.Sequential(*layers))
+
+        self.cv2[1].add_module('upsample', nn.Upsample(scale_factor=2, mode='nearest'))
+        self.cv2[2].add_module('upsample', nn.Upsample(scale_factor=4, mode='nearest'))
+
+        # 3. 聚合层
+        # 对应: self.cv3 = nn.Conv2d(3 * c3, embed, 1)
+        # 注意：原代码 cv3, cv4, cv5 是纯卷积还是带激活的？
+        # 根据 Ultralytics 习惯，单独写 nn.Conv2d 通常是不带 BN/Act 的，
+        # 但如果是 Feature Projection，通常用 ConvModule (1x1) 更好。
+        # 这里为了严格还原逻辑，cv3/4/5 使用纯 Conv2d，除非原代码中引入了 Conv 块。
+        # 既然原代码写的是 nn.Conv2d，我们就用 nn.Conv2d。
+
+        self.cv3 = nn.Conv2d(len(in_channels) * hidden_channels, embed_dims, 1)
+        self.cv4 = nn.Conv2d(len(in_channels) * hidden_channels, self.c, 3, padding=1)
+        self.cv5 = nn.Conv2d(1, self.c, 3, padding=1)  # 处理 mask 的卷积
+
+        # 4. 融合层 cv6
+        # 原逻辑: Sequential(Conv(2*c, c, 3), nn.Conv2d(c, c, 3, padding=1))
+        # 第一层用 ConvModule (带BN/SiLU)，第二层用纯 Conv2d
+        self.cv6 = nn.Sequential(
+            ConvModule(2 * self.c, self.c, 3, padding=1, **conv_cfg),
+            nn.Conv2d(self.c, self.c, 3, padding=1)
+        )
+
+    def forward(self, x, vp):
+        """
+        Args:
+            x (list[Tensor]): 多尺度特征图 [P3, P4, P5]
+            vp (Tensor): Visual Prompts / Masks, shape (B, Q, H, W)
+                         这里 H, W 应该对应 P3 的分辨率 (即 1/8 原图)
+        """
+        # --- 分支 2 处理 (Query生成相关) ---
+        y = [self.cv2[i](xi) for i, xi in enumerate(x)]
+        # 拼接并在通道维度映射
+        y = self.cv4(torch.cat(y, dim=1))
+
+        # --- 分支 1 处理 (Value/Key生成相关) ---
+        x_feats = [self.cv1[i](xi) for i, xi in enumerate(x)]
+        x_feats = self.cv3(torch.cat(x_feats, dim=1))
+
+        B, C, H, W = x_feats.shape
+
+        # x: (B, C, H*W) -> (B, C, N)
+        x_flat = x_feats.view(B, C, -1)
+
+        # 获取 Prompt 数量 Q
+        Q = vp.shape[1]
+
+        # --- 复杂的 Reshape 和 Expand 逻辑 ---
+        # 这里的目的是将 Visual Prompt (Q个) 与 图像特征进行融合
+
+        # y 扩展为 (B*Q, c, H, W)
+        # y: (B, c, H, W) -> (B, 1, c, H, W) -> (B, Q, c, H, W) -> (B*Q, c, H, W)
+        y_expanded = y.unsqueeze(1).expand(-1, Q, -1, -1, -1).reshape(B * Q, self.c, H, W)
+
+        # vp 扩展为 (B*Q, 1, H, W)
+        vp_expanded = vp.reshape(B * Q, 1, H, W)
+
+        # 特征融合: 图像特征 y 与 mask 特征 vp_expanded 拼接
+        # (B*Q, 2*c, H, W) -> (B*Q, c, H, W)
+        y_fused = self.cv6(torch.cat((y_expanded, self.cv5(vp_expanded)), dim=1))
+
+        # 恢复维度为 (B, Q, c, H*W)
+        y_fused = y_fused.reshape(B, Q, self.c, -1)
+
+        # mask 恢复维度 (B, Q, 1, H*W)
+        vp_flat = vp.reshape(B, Q, 1, -1)
+
+        # --- Attention / Masking 机制 ---
+        # 如果 vp 是 0 (背景)，则加上极小值，使 Softmax 后为 0
+        # 这一步是为了只关注 mask 区域内的特征
+        score = y_fused * vp_flat + torch.logical_not(vp_flat) * torch.finfo(y_fused.dtype).min
+
+        # Softmax over spatial dimensions (last dim)
+        score = F.softmax(score, dim=-1, dtype=torch.float).to(score.dtype)
+
+        # --- 聚合特征 ---
+        # score: (B, Q, c, N) -> transpose -> (B, Q, N, c)
+        # x_flat: (B, C, N) -> reshape -> (B, c, C/c, N) -> transpose -> (B, c, N, C/c)
+        # Matmul: (B, Q, N, c) @ (B, c, N, C/c) ??? 维度好像对不上
+
+        # 让我们仔细看原代码的矩阵乘法：
+        # aggregated = score.transpose(-2, -3) @ x.reshape(B, self.c, C // self.c, -1).transpose(-1, -2)
+
+        # score shape: (B, Q, c, N)
+        # score.transpose(-2, -3) -> (B, c, Q, N)  <-- 注意这里
+
+        # x shape: (B, C, N)
+        # x_reshaped: (B, c, C//c, N)
+        # x_reshaped.transpose(-1, -2): (B, c, N, C//c)
+
+        # Matmul: (B, c, Q, N) @ (B, c, N, C//c)
+        # Result: (B, c, Q, C//c)
+
+        # Re-implementing strictly:
+        score_t = score.transpose(1, 2)  # (B, c, Q, N)
+
+        x_reshaped_t = x_flat.reshape(B, self.c, C // self.c, -1).transpose(-1, -2)  # (B, c, N, C//c)
+
+        aggregated = score_t @ x_reshaped_t  # (B, c, Q, C//c)
+
+        # transpose(-2, -3) -> (B, Q, c, C//c)
+        # reshape -> (B, Q, C)
+        final_out = aggregated.transpose(1, 2).reshape(B, Q, -1)
+
+        return F.normalize(final_out, dim=-1, p=2)
+
+
+class DeformablePromptEncoder(BaseModule):
+    def __init__(self,
+                 in_channels=[256, 512, 512],  # [256, 512, 1024]
+                 hidden_channels=256,  # 256 (用于中间投影)
+                 embed_dims=512,  # 512 (最终输出维度，需与 text embedding 一致)
+                 num_heads=8,
+                 num_points=4,  # 每个 head 采样的点数
+                 feedforward_channels=1024,
+                 dropout=0.1,
+                 norm_cfg=dict(type='GN', num_groups=32),
+                 init_cfg=None):
+        super().__init__(init_cfg)
+
+        self.embed_dims = embed_dims
+
+        # 1. 多尺度特征投影层 (将 P3, P4, P5 统一映射到 embed_dims)
+        self.input_projs = nn.ModuleList()
+        for ch in in_channels:
+            self.input_projs.append(
+                nn.Sequential(
+                    nn.Conv2d(ch, embed_dims, 1),
+                    build_norm_layer(norm_cfg, embed_dims)[1]
+                )
+            )
+
+        # 2. Level Embeddings (区分不同尺度)
+        self.level_embeds = nn.Parameter(torch.Tensor(len(in_channels), embed_dims))
+
+        # 3. Deformable Attention 核心层
+        # batch_first=True: 输入 query 为 (B, N, C)
+        self.cross_attn = MultiScaleDeformableAttention(
+            embed_dims=embed_dims,
+            num_levels=len(in_channels),
+            num_heads=num_heads,
+            num_points=num_points,
+            dropout=dropout,
+            batch_first=True
+        )
+
+        # 4. FFN (Feed-Forward Network)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dims, feedforward_channels),
+            nn.GELU(),
+            nn.Linear(feedforward_channels, embed_dims)
+        )
+
+        # 5. Norms
+        self.norm1 = nn.LayerNorm(embed_dims)
+        self.norm2 = nn.LayerNorm(embed_dims)
+
+        # 6. Query 初始化投影 (将 P3 特征用于初始化 Query)
+        # SAVPE 输入的是 list，我们通常取分辨率最高的 P3 做 mask pooling
+        self.query_init_proj = nn.Conv2d(in_channels[0], embed_dims, 1)
+
+    def init_weights(self):
+        super().init_weights()
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+        for m in self.modules():
+            if isinstance(m, MultiScaleDeformableAttention):
+                m.init_weights()
+        xavier_init(self.level_embeds, distribution='uniform')
+
+    def get_reference_points(self, visual_masks):
+        """
+        计算 Mask 重心作为 Deformable Attention 的参考点。
+        Args:
+            visual_masks: (B, N, H, W) - H, W 对应 P3 分辨率
+        Returns:
+            reference_points: (B, N, 1, 2) 归一化坐标 (cx, cy)
+        """
+        B, N, H, W = visual_masks.shape
+        device = visual_masks.device
+
+        # 生成网格 (y, x)
+        y_grid, x_grid = torch.meshgrid(
+            torch.arange(H, device=device, dtype=torch.float32),
+            torch.arange(W, device=device, dtype=torch.float32),
+            indexing='ij'
+        )
+
+        # 增加维度以广播: (1, 1, H, W)
+        y_grid = y_grid.unsqueeze(0).unsqueeze(0)
+        x_grid = x_grid.unsqueeze(0).unsqueeze(0)
+
+        # 加个 epsilon 防止除零 (有些 mask 可能是空的)
+        mask_sum = visual_masks.sum(dim=[-1, -2]) + 1e-6
+
+        # 计算重心: sum(coord * weight) / sum(weight)
+        # visual_masks 是 0/1 或者是 float 的权重
+        cx = (visual_masks * x_grid).sum(dim=[-1, -2]) / mask_sum
+        cy = (visual_masks * y_grid).sum(dim=[-1, -2]) / mask_sum
+
+        # 归一化到 [0, 1]
+        # 注意: x 对应 W, y 对应 H
+        cx_norm = cx / W
+        cy_norm = cy / H
+
+        # 堆叠 -> (B, N, 2) -> (B, N, 1, 2) (1 代表 num_levels 维度广播)
+        ref_points = torch.stack([cx_norm, cy_norm], dim=-1).unsqueeze(2)
+
+        # 截断到有效范围，防止 NaN 或越界
+        return ref_points.clamp(0.01, 0.99)
+
+    def forward(self, x, vp):
+        """
+        Args:
+            x (list[Tensor]): [P3, P4, P5]
+            vp (Tensor): Visual Masks (B, N, H, W) - 对应 P3 分辨率
+        Returns:
+            out (Tensor): (B, N, embed_dims)
+        """
+        # x[0] 是 P3, 形状 (B, C0, H, W)
+        B, N, H, W = vp.shape
+
+        # -----------------------------------------------------------
+        # 1. 准备 Multi-scale Key/Value
+        # -----------------------------------------------------------
+        src_flattens = []
+        spatial_shapes = []
+
+        for idx, feat in enumerate(x):
+            # 投影到 embed_dims
+            src = self.input_projs[idx](feat)  # (B, C, H_i, W_i)
+            bs, c, h_i, w_i = src.shape
+            spatial_shapes.append((h_i, w_i))
+
+            # Flatten: (B, H_i*W_i, C)
+            src = src.flatten(2).transpose(1, 2)
+
+            # 加上 Level Embedding (区分 P3, P4, P5)
+            src = src + self.level_embeds[idx].view(1, 1, -1)
+            src_flattens.append(src)
+
+        # 拼接所有层特征: (B, Sum_HW, C)
+        src_flattens = torch.cat(src_flattens, 1)
+
+        # 构建 MSDA 需要的 spatial_shapes 和 level_start_index
+        spatial_shapes = torch.tensor(spatial_shapes, device=vp.device, dtype=torch.long)
+        level_start_index = torch.cat((spatial_shapes.new_zeros((1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
+
+        # -----------------------------------------------------------
+        # 2. 初始化 Query (Content-Aware Initialization)
+        # -----------------------------------------------------------
+        # 使用 Mask 在 P3 特征上做加权平均，作为 Query 的初始值
+        # 相比 SAVPE，我们这里只用 P3 做初始化，依靠 Attention 去看 P4/P5
+
+        p3_feat = x[0]  # (B, C_in, H, W)
+        p3_proj = self.query_init_proj(p3_feat)  # (B, C_embed, H, W)
+
+        # Mask Pooling
+        # vp: (B, N, H, W) -> (B, N, 1, H, W)
+        vp_expanded = vp.unsqueeze(2)
+        # p3: (B, C, H, W) -> (B, 1, C, H, W)
+        p3_expanded = p3_proj.unsqueeze(1)
+
+        mask_sum = vp_expanded.sum(dim=[-1, -2]) + 1e-6
+        # Sum Pooling -> (B, N, C)
+        query_init = (p3_expanded * vp_expanded).sum(dim=[-1, -2]) / mask_sum
+
+        # -----------------------------------------------------------
+        # 3. 准备 Reference Points
+        # -----------------------------------------------------------
+        reference_points = self.get_reference_points(vp)  # (B, N, 1, 2)
+
+        # -----------------------------------------------------------
+        # 4. Deformable Attention Cross-Interaction
+        # -----------------------------------------------------------
+        # query: (B, N, C)
+        # value: (B, Sum_HW, C)
+        query_interact = self.cross_attn(
+            query=query_init,
+            value=src_flattens,
+            reference_points=reference_points,
+            spatial_shapes=spatial_shapes,
+            level_start_index=level_start_index
+        )
+
+        # Residual + Norm
+        query_out = self.norm1(query_init + query_interact)
+
+        # -----------------------------------------------------------
+        # 5. FFN
+        # -----------------------------------------------------------
+        query_final = self.norm2(query_out + self.ffn(query_out))
+
+        # Output: (B, N, 512)
+        # 这里的 N 就是 mask 的通道数，不需要 reshape 操作
+        # 且我们使用了 L2 Norm 在外部 Hook 做，这里保持 raw feature 即可
+        # 如果需要保持和 SAVPE 完全一致的输出分布，可以在这里加 F.normalize
+        return F.normalize(query_final, dim=-1, p=2)
+
+
+# class OrthogonalFusionModule(nn.Module):
+#     """
+#     正交特征融合模块 (OPR)
+#     """
+#
+#     def __init__(self, embed_dims=512):
+#         super().__init__()
+#
+#         # 1. Adapter: 将 Visual 空间映射到 Text 空间
+#         self.visual_adapter = nn.Sequential(
+#             nn.Linear(embed_dims, embed_dims),
+#             nn.LayerNorm(embed_dims),
+#             nn.SiLU(),
+#             nn.Linear(embed_dims, embed_dims)
+#         )
+#
+#         # 2. Gating Network: 用于决定注入多少 "个性细节" (垂直分量)
+#         self.detail_gate = nn.Sequential(
+#             nn.Linear(embed_dims * 2, embed_dims),
+#             nn.Sigmoid()
+#         )
+#
+#         # 可学习的缩放因子
+#         self.para_scale = nn.Parameter(torch.ones(1) * 0.5)
+#
+#     def forward(self, txt_feats, vis_feats):
+#         # Alignment
+#         v_proj = self.visual_adapter(vis_feats)
+#
+#         # Orthogonal Decomposition
+#         t_norm = txt_feats.norm(dim=-1, keepdim=True) + 1e-6
+#         t_unit = txt_feats / t_norm
+#
+#         projection_scalar = (v_proj * t_unit).sum(dim=-1, keepdim=True)
+#         v_para = projection_scalar * t_unit
+#         v_orth = v_proj - v_para
+#
+#         # Gated Recomposition
+#         gate = self.detail_gate(torch.cat([txt_feats, v_orth], dim=-1))
+#         fused_feats = txt_feats + (self.para_scale * v_para) + (gate * v_orth)
+#
+#         return fused_feats
+
+class OrthogonalFusionModule(nn.Module):
+    """
+    正交特征融合模块 (OPR) V2.0
+    改进点：
+    1. 双门控机制：同时动态控制平行分量(共性)和垂直分量(细节)的注入比例。
+    2. 返回投影后的视觉特征，以便计算对齐 Loss。
+    """
+
+    def __init__(self, embed_dims=512):
+        super().__init__()
+
+        # 1. Adapter: 将 Visual 空间映射到 Text 空间
+        # 这是为了弥合 CNN/ViT 特征与 CLIP Text 特征的异构性
+        self.visual_adapter = nn.Sequential(
+            nn.Linear(embed_dims, embed_dims),
+            nn.LayerNorm(embed_dims),
+            nn.SiLU(),
+            nn.Linear(embed_dims, embed_dims)
+        )
+
+        # 2. Detail Gate: 控制垂直分量 (个性/细节/噪声)
+        # 输入: cat([txt, v_orth]) -> 决定还需要多少细节
+        self.detail_gate = nn.Sequential(
+            nn.Linear(embed_dims * 2, embed_dims),
+            nn.Sigmoid()
+        )
+
+        # 3. [新增] Parallel Gate: 控制平行分量 (视觉共性验证)
+        # 替代了原来的 self.para_scale
+        # 输入: cat([txt, v_proj]) -> 根据文本和视觉的匹配程度，决定视觉共性的权重
+        # 逻辑: 对于 Rare 类，如果视觉特征很强且匹配，这个 Gate 应该变大
+        self.para_gate = nn.Sequential(
+            nn.Linear(embed_dims * 2, embed_dims),
+            nn.Sigmoid()
+        )
+
+        # self.out_norm = nn.LayerNorm(embed_dims)
+
+    def forward(self, txt_feats, vis_feats):
+        """
+        Args:
+            txt_feats: (B, C)
+            vis_feats: (B, C) 来自 SAVPE 的原始输出
+        Returns:
+            fused_feats: (B, C)
+            v_proj: (B, C) 经过适配器的视觉特征 (用于计算 Align Loss)
+        """
+        # --- Step 1: Alignment & Mapping ---
+        # 必须先映射，再做分解
+        v_proj = self.visual_adapter(vis_feats)
+
+        # --- Step 2: Orthogonal Decomposition ---
+        # 归一化文本向量作为基准
+        t_norm = txt_feats.norm(dim=-1, keepdim=True) + 1e-6
+        t_unit = txt_feats / t_norm
+
+        # 计算投影 (平行分量 - 共性)
+        # (v_proj · t_unit) * t_unit
+        projection_scalar = (v_proj * t_unit).sum(dim=-1, keepdim=True)
+        v_para = projection_scalar * t_unit
+
+        # 计算残差 (垂直分量 - 细节)
+        v_orth = v_proj - v_para
+
+        # --- Step 3: Dual Gated Recomposition (双动态门控) ---
+
+        # Gate 1: 平行门控 (决定视觉共性有多重要)
+        # 它可以学习到：当 Text 很强时，是否还需要叠加 Visual 的共性？
+        alpha_para = self.para_gate(torch.cat([txt_feats, v_proj], dim=-1))
+
+        # Gate 2: 细节门控 (决定注入多少细节)
+        # 它可以学习到：当 Visual 包含 Text 没有的信息时，打开门
+        beta_orth = self.detail_gate(torch.cat([txt_feats, v_orth], dim=-1))
+
+        # 最终融合
+        # Base(Text) + Dynamic(Visual_Para) + Dynamic(Visual_Orth)
+        fused_feats = txt_feats + (alpha_para * v_para) + (beta_orth * v_orth)
+
+        fused_feats = F.normalize(fused_feats, dim=-1)
+
+        return fused_feats, v_proj
