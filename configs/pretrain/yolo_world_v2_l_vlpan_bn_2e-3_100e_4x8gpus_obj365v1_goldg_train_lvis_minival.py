@@ -254,13 +254,17 @@ METAINFO = {
 # hyper-parameters
 num_classes = 1203
 num_training_classes = 80
-max_epochs = 100  # Maximum training epochs
-close_mosaic_epochs = 2
+#max_epochs = 100  # Maximum training epochs
+max_epochs = 5
+#close_mosaic_epochs = 2
+close_mosaic_epochs = 5
 save_epoch_intervals = 1
 text_channels = 512
 neck_embed_channels = [128, 256, _base_.last_stage_out_channels // 2]
 neck_num_heads = [4, 8, _base_.last_stage_out_channels // 2 // 32]
-base_lr = 2e-3
+#base_lr = 2e-3
+base_lr = 2e-4
+#base_lr = 2e-5
 weight_decay = 0.05 / 2
 train_batch_size_per_gpu = 8
 # text_model_name = '../pretrained_models/clip-vit-base-patch32-projection'
@@ -463,9 +467,57 @@ test_evaluator = val_evaluator
 # test_evaluator = val_evaluator
 
 # training settings
-default_hooks = dict(param_scheduler=dict(max_epochs=max_epochs),
-                     checkpoint=dict(interval=1,
-                                     rule='greater'))
+# default_hooks = dict(param_scheduler=dict(max_epochs=max_epochs),
+#                      checkpoint=dict(interval=1,
+#                                      rule='greater'))
+# 定义具体的调度策略：全程保持学习率不变
+# param_scheduler = [
+#     dict(
+#         type='ConstantLR',
+#         factor=1.0,       # 1.0 表示始终保持 base_lr 的 100% (即 2e-5)
+#         by_epoch=True,    # 按 epoch 更新
+#         begin=0,          # 从第 0 epoch 开始
+#         end=5             # 到第 5 epoch 结束 (对应你的 max_epochs=5)
+#     )
+# ]
+# default_hooks = dict(
+#     param_scheduler=dict(
+#         _delete_=True,            # <--- 必须加！清除父配置的参数
+#         type='ParamSchedulerHook' # 换成 MMEngine 的标准调度器钩子
+#     ),
+#     checkpoint=dict(interval=1, rule='greater')
+# )
+
+# [推荐配置] 适用于短周期(5-20 epoch)的新模块对齐训练
+param_scheduler = [
+    # 1. Warmup 阶段: 第 0-1 个 epoch，学习率从 0.001*lr 线性增加到 lr
+    dict(
+        type='LinearLR',
+        start_factor=0.001,
+        by_epoch=True,
+        begin=0,
+        end=1,  # 热身 1 个 epoch
+        convert_to_iter_based=True  # 自动转换为基于 iter 的平滑热身
+    ),
+    # 2. Constant 阶段: 第 1-5 个 epoch，保持全速学习率
+    dict(
+        type='ConstantLR',
+        factor=1.0,
+        by_epoch=True,
+        begin=1,
+        end=max_epochs  # 直到训练结束
+    )
+]
+
+# 必须更新 default_hooks 以应用新的调度器
+default_hooks = dict(
+    param_scheduler=dict(
+        _delete_=True,            # 清除 yolov8 默认的调度器
+        type='ParamSchedulerHook' # 使用 MMEngine 通用调度器
+    ),
+    checkpoint=dict(interval=1, rule='greater') # 每个 epoch 保存
+)
+
 custom_hooks = [
     dict(type='EMAHook',
          ema_type='ExpMomentumEMA',
@@ -544,11 +596,94 @@ train_cfg = dict(max_epochs=max_epochs,
 # )
 
 #下面这个优化器是模块和head头（学习率乘0.1）一起训练
+# optim_wrapper = dict(
+#     optimizer=dict(
+#         _delete_=True,
+#         type='AdamW',
+#         lr=base_lr,  # 这里的 base_lr 是 2e-3
+#         weight_decay=weight_decay,
+#         batch_size_per_gpu=train_batch_size_per_gpu),
+#
+#     # [核心修改] 参数级精细化配置
+#     paramwise_cfg=dict(
+#         bias_decay_mult=0.0,
+#         norm_decay_mult=0.0,
+#
+#         # custom_keys 字典：键是参数名的一部分，值是配置
+#         custom_keys={
+#             # 1. 冻结 Backbone (包含 Image Encoder)
+#             'backbone': dict(lr_mult=0.0),
+#
+#             # 2. 冻结 Text Encoder (CLIP)
+#             'text_model': dict(lr_mult=0.0),
+#
+#             # 3. 冻结 Neck (PAFPN)
+#             'neck': dict(lr_mult=0.0),
+#
+#             # 4. 冻结 Logit Scale (温度系数)
+#             'logit_scale': dict(lr_mult=0.0),
+#
+#             # 5. Head 部分学习率乘以0.1
+#             'bbox_head': dict(lr_mult=0.1),
+#
+#             # 6. [核心] 唯独解冻 SAVPE
+#             # 这里的 key 必须写得比 'bbox_head' 更长、更具体，以触发最长匹配原则
+#             # 参数的全名通常是: bbox_head.head_module.savpe.xxx
+#             'bbox_head.head_module.savpe': dict(lr_mult=1.0, decay_mult=1.0),
+#             'bbox_head.head_module.opr_fusion': dict(lr_mult=1.0, decay_mult=1.0),
+#         }
+#     ),
+#     constructor='YOLOWv5OptimizerConstructor'
+# )
+
+#只训练deformablepromptencoder，但是同时有对其损失
+# optim_wrapper = dict(
+#     optimizer=dict(
+#         _delete_=True,
+#         type='AdamW',
+#         lr=base_lr,
+#         weight_decay=weight_decay,
+#         batch_size_per_gpu=train_batch_size_per_gpu),
+#
+#     # [核心修改] 参数级精细化配置
+#     paramwise_cfg=dict(
+#         bias_decay_mult=0.0,
+#         norm_decay_mult=0.0,
+#
+#         # custom_keys 字典：键是参数名的一部分，值是配置
+#         custom_keys={
+#             # 1. 冻结 Backbone (包含 Image Encoder)
+#             'backbone': dict(lr_mult=0.0),
+#
+#             # 2. 冻结 Text Encoder (CLIP)
+#             'text_model': dict(lr_mult=0.0),
+#
+#             # 3. 冻结 Neck (PAFPN)
+#             'neck': dict(lr_mult=0.0),
+#
+#             # 4. 冻结 Logit Scale (温度系数)
+#             'logit_scale': dict(lr_mult=0.0),
+#
+#             # 5. Head 部分学习率乘以0.1
+#             'bbox_head': dict(lr_mult=0.0),
+#
+#             # 6. [核心] 唯独解冻 SAVPE
+#             # 这里的 key 必须写得比 'bbox_head' 更长、更具体，以触发最长匹配原则
+#             # 参数的全名通常是: bbox_head.head_module.savpe.xxx
+#             'bbox_head.head_module.savpe': dict(lr_mult=1.0, decay_mult=1.0),
+#             'bbox_head.head_module.opr_fusion.visual_adapter': dict(lr_mult=1.0, decay_mult=1.0),
+#         }
+#     ),
+#     constructor='YOLOWv5OptimizerConstructor'
+# )
+
+
+#第二阶段，融合模块1.0，图像提示0.1，head冻住
 optim_wrapper = dict(
     optimizer=dict(
         _delete_=True,
         type='AdamW',
-        lr=base_lr,  # 这里的 base_lr 是 2e-3
+        lr=base_lr,
         weight_decay=weight_decay,
         batch_size_per_gpu=train_batch_size_per_gpu),
 
@@ -572,20 +707,31 @@ optim_wrapper = dict(
             'logit_scale': dict(lr_mult=0.0),
 
             # 5. Head 部分学习率乘以0.1
-            'bbox_head': dict(lr_mult=0.1),
+            'bbox_head': dict(lr_mult=0.0),
 
             # 6. [核心] 唯独解冻 SAVPE
             # 这里的 key 必须写得比 'bbox_head' 更长、更具体，以触发最长匹配原则
             # 参数的全名通常是: bbox_head.head_module.savpe.xxx
-            'bbox_head.head_module.savpe': dict(lr_mult=1.0, decay_mult=1.0),
+            'bbox_head.head_module.savpe': dict(lr_mult=0.1, decay_mult=1.0),
             'bbox_head.head_module.opr_fusion': dict(lr_mult=1.0, decay_mult=1.0),
+            'bbox_head.head_module.opr_fusion.visual_adapter': dict(lr_mult=0.1, decay_mult=1.0),
         }
     ),
     constructor='YOLOWv5OptimizerConstructor'
 )
 
 
+
+
+
 #load_from = 'work_dirs/train_deformable_nofuse_val_minival/20251203_193453/epoch_2.pth'
 #load_from = 'official_pretraind_models/yolo-world-l-640.pth'
 #load_from = 'work_dirs/finetune_deformable_contrast_fuse_fromofficialyoloworld_val_minival/epoch_2.pth'
-load_from = '/data/codes/WangShuo/py_project/YOLO-World-research/YOLO-World/work_dirs/finetune_contrast_fusev2_fromofficialyoloworld_val_minival/epoch_1.pth'
+#load_from = '/data/codes/WangShuo/py_project/YOLO-World-research/YOLO-World/work_dirs/finetune_contrast_fusev2_fromofficialyoloworld_val_minival/20251216_213704/epoch_1.pth'
+load_from = 'work_dirs/finetune_deformablev2_only_load_officialmodel_lr2e-4_close_mosaic_5epoch/20251224_000816/epoch_3.pth'
+
+
+model_wrapper_cfg = dict(
+    type='MMDistributedDataParallel',
+    find_unused_parameters=True
+)

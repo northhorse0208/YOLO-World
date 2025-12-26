@@ -362,6 +362,24 @@ class YOLOWorldHeadModule(YOLOv8HeadModule):
             # 填回
             fused_txt_feats[i, :K, :] = fused_k
 
+            # stage1 只训练deformablepromptencoder，但是也加入对齐损失
+            # 1. 投影映射 (Projection)
+            # 我们直接调用 OPR 模块里的 visual_adapter 子模块
+            # 这样既复用了代码，又保证了权重位置正确
+            # v_proj_k = self.opr_fusion.visual_adapter(vis_k)  # (K, 512)
+            #
+            # # 2. 计算对齐损失 (Alignment Loss)
+            # # 强制投影后的视觉特征 v_proj_k 靠近 CLIP 文本特征 txt_k
+            # sim = F.cosine_similarity(v_proj_k, txt_k, dim=-1)
+            # align_loss += (1.0 - sim).sum()
+            # num_valid_samples += K
+            #
+            # # 3. 特征替换 (Replacement)
+            # # 我们完全跳过 opr_fusion.forward 的融合逻辑
+            # # 直接把 v_proj_k 填入 fused_txt_feats
+            # # 此时 Head 接收到的就是 "伪装成文本的视觉特征"
+            # fused_txt_feats[i, :K, :] = v_proj_k
+
             # 平均 Loss
         if num_valid_samples > 0:
             align_loss = align_loss / num_valid_samples
@@ -1026,22 +1044,214 @@ class SAVPE(BaseModule):
         return F.normalize(final_out, dim=-1, p=2)
 
 
+# class DeformablePromptEncoder(BaseModule):
+#     def __init__(self,
+#                  in_channels=[256, 512, 512],  # [256, 512, 1024]
+#                  hidden_channels=256,  # 256 (用于中间投影)
+#                  embed_dims=512,  # 512 (最终输出维度，需与 text embedding 一致)
+#                  num_heads=8,
+#                  num_points=4,  # 每个 head 采样的点数
+#                  feedforward_channels=1024,
+#                  dropout=0.1,
+#                  norm_cfg=dict(type='GN', num_groups=32),
+#                  init_cfg=None):
+#         super().__init__(init_cfg)
+#
+#         self.embed_dims = embed_dims
+#
+#         # 1. 多尺度特征投影层 (将 P3, P4, P5 统一映射到 embed_dims)
+#         self.input_projs = nn.ModuleList()
+#         for ch in in_channels:
+#             self.input_projs.append(
+#                 nn.Sequential(
+#                     nn.Conv2d(ch, embed_dims, 1),
+#                     build_norm_layer(norm_cfg, embed_dims)[1]
+#                 )
+#             )
+#
+#         # 2. Level Embeddings (区分不同尺度)
+#         self.level_embeds = nn.Parameter(torch.Tensor(len(in_channels), embed_dims))
+#
+#         # 3. Deformable Attention 核心层
+#         # batch_first=True: 输入 query 为 (B, N, C)
+#         self.cross_attn = MultiScaleDeformableAttention(
+#             embed_dims=embed_dims,
+#             num_levels=len(in_channels),
+#             num_heads=num_heads,
+#             num_points=num_points,
+#             dropout=dropout,
+#             batch_first=True
+#         )
+#
+#         # 4. FFN (Feed-Forward Network)
+#         self.ffn = nn.Sequential(
+#             nn.Linear(embed_dims, feedforward_channels),
+#             nn.GELU(),
+#             nn.Linear(feedforward_channels, embed_dims)
+#         )
+#
+#         # 5. Norms
+#         self.norm1 = nn.LayerNorm(embed_dims)
+#         self.norm2 = nn.LayerNorm(embed_dims)
+#
+#         # 6. Query 初始化投影 (将 P3 特征用于初始化 Query)
+#         # SAVPE 输入的是 list，我们通常取分辨率最高的 P3 做 mask pooling
+#         self.query_init_proj = nn.Conv2d(in_channels[0], embed_dims, 1)
+#
+#     def init_weights(self):
+#         super().init_weights()
+#         for p in self.parameters():
+#             if p.dim() > 1:
+#                 nn.init.xavier_uniform_(p)
+#         for m in self.modules():
+#             if isinstance(m, MultiScaleDeformableAttention):
+#                 m.init_weights()
+#         xavier_init(self.level_embeds, distribution='uniform')
+#
+#     def get_reference_points(self, visual_masks):
+#         """
+#         计算 Mask 重心作为 Deformable Attention 的参考点。
+#         Args:
+#             visual_masks: (B, N, H, W) - H, W 对应 P3 分辨率
+#         Returns:
+#             reference_points: (B, N, 1, 2) 归一化坐标 (cx, cy)
+#         """
+#         B, N, H, W = visual_masks.shape
+#         device = visual_masks.device
+#
+#         # 生成网格 (y, x)
+#         y_grid, x_grid = torch.meshgrid(
+#             torch.arange(H, device=device, dtype=torch.float32),
+#             torch.arange(W, device=device, dtype=torch.float32),
+#             indexing='ij'
+#         )
+#
+#         # 增加维度以广播: (1, 1, H, W)
+#         y_grid = y_grid.unsqueeze(0).unsqueeze(0)
+#         x_grid = x_grid.unsqueeze(0).unsqueeze(0)
+#
+#         # 加个 epsilon 防止除零 (有些 mask 可能是空的)
+#         mask_sum = visual_masks.sum(dim=[-1, -2]) + 1e-6
+#
+#         # 计算重心: sum(coord * weight) / sum(weight)
+#         # visual_masks 是 0/1 或者是 float 的权重
+#         cx = (visual_masks * x_grid).sum(dim=[-1, -2]) / mask_sum
+#         cy = (visual_masks * y_grid).sum(dim=[-1, -2]) / mask_sum
+#
+#         # 归一化到 [0, 1]
+#         # 注意: x 对应 W, y 对应 H
+#         cx_norm = cx / W
+#         cy_norm = cy / H
+#
+#         # 堆叠 -> (B, N, 2) -> (B, N, 1, 2) (1 代表 num_levels 维度广播)
+#         ref_points = torch.stack([cx_norm, cy_norm], dim=-1).unsqueeze(2)
+#
+#         # 截断到有效范围，防止 NaN 或越界
+#         return ref_points.clamp(0.01, 0.99)
+#
+#     def forward(self, x, vp):
+#         """
+#         Args:
+#             x (list[Tensor]): [P3, P4, P5]
+#             vp (Tensor): Visual Masks (B, N, H, W) - 对应 P3 分辨率
+#         Returns:
+#             out (Tensor): (B, N, embed_dims)
+#         """
+#         # x[0] 是 P3, 形状 (B, C0, H, W)
+#         B, N, H, W = vp.shape
+#
+#         # -----------------------------------------------------------
+#         # 1. 准备 Multi-scale Key/Value
+#         # -----------------------------------------------------------
+#         src_flattens = []
+#         spatial_shapes = []
+#
+#         for idx, feat in enumerate(x):
+#             # 投影到 embed_dims
+#             src = self.input_projs[idx](feat)  # (B, C, H_i, W_i)
+#             bs, c, h_i, w_i = src.shape
+#             spatial_shapes.append((h_i, w_i))
+#
+#             # Flatten: (B, H_i*W_i, C)
+#             src = src.flatten(2).transpose(1, 2)
+#
+#             # 加上 Level Embedding (区分 P3, P4, P5)
+#             src = src + self.level_embeds[idx].view(1, 1, -1)
+#             src_flattens.append(src)
+#
+#         # 拼接所有层特征: (B, Sum_HW, C)
+#         src_flattens = torch.cat(src_flattens, 1)
+#
+#         # 构建 MSDA 需要的 spatial_shapes 和 level_start_index
+#         spatial_shapes = torch.tensor(spatial_shapes, device=vp.device, dtype=torch.long)
+#         level_start_index = torch.cat((spatial_shapes.new_zeros((1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
+#
+#         # -----------------------------------------------------------
+#         # 2. 初始化 Query (Content-Aware Initialization)
+#         # -----------------------------------------------------------
+#         # 使用 Mask 在 P3 特征上做加权平均，作为 Query 的初始值
+#         # 相比 SAVPE，我们这里只用 P3 做初始化，依靠 Attention 去看 P4/P5
+#
+#         p3_feat = x[0]  # (B, C_in, H, W)
+#         p3_proj = self.query_init_proj(p3_feat)  # (B, C_embed, H, W)
+#
+#         # Mask Pooling
+#         # vp: (B, N, H, W) -> (B, N, 1, H, W)
+#         vp_expanded = vp.unsqueeze(2)
+#         # p3: (B, C, H, W) -> (B, 1, C, H, W)
+#         p3_expanded = p3_proj.unsqueeze(1)
+#
+#         mask_sum = vp_expanded.sum(dim=[-1, -2]) + 1e-6
+#         # Sum Pooling -> (B, N, C)
+#         query_init = (p3_expanded * vp_expanded).sum(dim=[-1, -2]) / mask_sum
+#
+#         # -----------------------------------------------------------
+#         # 3. 准备 Reference Points
+#         # -----------------------------------------------------------
+#         reference_points = self.get_reference_points(vp)  # (B, N, 1, 2)
+#
+#         # -----------------------------------------------------------
+#         # 4. Deformable Attention Cross-Interaction
+#         # -----------------------------------------------------------
+#         # query: (B, N, C)
+#         # value: (B, Sum_HW, C)
+#         query_interact = self.cross_attn(
+#             query=query_init,
+#             value=src_flattens,
+#             reference_points=reference_points,
+#             spatial_shapes=spatial_shapes,
+#             level_start_index=level_start_index
+#         )
+#
+#         # Residual + Norm
+#         query_out = self.norm1(query_init + query_interact)
+#
+#         # -----------------------------------------------------------
+#         # 5. FFN
+#         # -----------------------------------------------------------
+#         query_final = self.norm2(query_out + self.ffn(query_out))
+#
+#         # Output: (B, N, 512)
+#         # 这里的 N 就是 mask 的通道数，不需要 reshape 操作
+#         # 且我们使用了 L2 Norm 在外部 Hook 做，这里保持 raw feature 即可
+#         # 如果需要保持和 SAVPE 完全一致的输出分布，可以在这里加 F.normalize
+#         return F.normalize(query_final, dim=-1, p=2)
+
 class DeformablePromptEncoder(BaseModule):
     def __init__(self,
-                 in_channels=[256, 512, 512],  # [256, 512, 1024]
-                 hidden_channels=256,  # 256 (用于中间投影)
-                 embed_dims=512,  # 512 (最终输出维度，需与 text embedding 一致)
+                 in_channels=[256, 512, 512],
+                 hidden_channels=256,
+                 embed_dims=512,
                  num_heads=8,
-                 num_points=4,  # 每个 head 采样的点数
+                 num_points=4,
                  feedforward_channels=1024,
                  dropout=0.1,
                  norm_cfg=dict(type='GN', num_groups=32),
                  init_cfg=None):
         super().__init__(init_cfg)
-
         self.embed_dims = embed_dims
 
-        # 1. 多尺度特征投影层 (将 P3, P4, P5 统一映射到 embed_dims)
+        # 1. Input Projections
         self.input_projs = nn.ModuleList()
         for ch in in_channels:
             self.input_projs.append(
@@ -1051,11 +1261,10 @@ class DeformablePromptEncoder(BaseModule):
                 )
             )
 
-        # 2. Level Embeddings (区分不同尺度)
+        # 2. Level Embeddings
         self.level_embeds = nn.Parameter(torch.Tensor(len(in_channels), embed_dims))
 
-        # 3. Deformable Attention 核心层
-        # batch_first=True: 输入 query 为 (B, N, C)
+        # 3. Deformable Attention
         self.cross_attn = MultiScaleDeformableAttention(
             embed_dims=embed_dims,
             num_levels=len(in_channels),
@@ -1065,7 +1274,7 @@ class DeformablePromptEncoder(BaseModule):
             batch_first=True
         )
 
-        # 4. FFN (Feed-Forward Network)
+        # 4. FFN
         self.ffn = nn.Sequential(
             nn.Linear(embed_dims, feedforward_channels),
             nn.GELU(),
@@ -1076,8 +1285,7 @@ class DeformablePromptEncoder(BaseModule):
         self.norm1 = nn.LayerNorm(embed_dims)
         self.norm2 = nn.LayerNorm(embed_dims)
 
-        # 6. Query 初始化投影 (将 P3 特征用于初始化 Query)
-        # SAVPE 输入的是 list，我们通常取分辨率最高的 P3 做 mask pooling
+        # 6. Query Init Projection
         self.query_init_proj = nn.Conv2d(in_channels[0], embed_dims, 1)
 
     def init_weights(self):
@@ -1090,113 +1298,101 @@ class DeformablePromptEncoder(BaseModule):
                 m.init_weights()
         xavier_init(self.level_embeds, distribution='uniform')
 
-    def get_reference_points(self, visual_masks):
+    def get_reference_points_and_query(self, visual_masks, p3_feat):
         """
-        计算 Mask 重心作为 Deformable Attention 的参考点。
+        改进版：寻找 Mask 区域内特征响应最强的点作为参考点，并采样该点的特征作为 Query。
+        解决 '重心落在背景' 和 '平均特征模糊' 的问题。
+
         Args:
-            visual_masks: (B, N, H, W) - H, W 对应 P3 分辨率
+            visual_masks: (B, N, H, W)
+            p3_feat: (B, C, H, W) - 已经投影到 embed_dims 的特征
         Returns:
-            reference_points: (B, N, 1, 2) 归一化坐标 (cx, cy)
+            ref_points: (B, N, 1, 2) normalized [0, 1]
+            query_init: (B, N, C)
         """
         B, N, H, W = visual_masks.shape
-        device = visual_masks.device
 
-        # 生成网格 (y, x)
-        y_grid, x_grid = torch.meshgrid(
-            torch.arange(H, device=device, dtype=torch.float32),
-            torch.arange(W, device=device, dtype=torch.float32),
-            indexing='ij'
-        )
+        # 1. 计算特征的响应强度 (L2 Norm) -> (B, 1, H, W)
+        # 我们假设模长越大的点，包含的信息量越大（前景概率越高）
+        feature_norm = torch.norm(p3_feat, dim=1, keepdim=True)
 
-        # 增加维度以广播: (1, 1, H, W)
-        y_grid = y_grid.unsqueeze(0).unsqueeze(0)
-        x_grid = x_grid.unsqueeze(0).unsqueeze(0)
+        # 2. 结合 Mask: 只保留 Mask 内部的响应
+        # visual_masks (B, N, H, W) * feature_norm (B, 1, H, W) -> (B, N, H, W)
+        masked_response = visual_masks * feature_norm
 
-        # 加个 epsilon 防止除零 (有些 mask 可能是空的)
-        mask_sum = visual_masks.sum(dim=[-1, -2]) + 1e-6
+        # 3. 展平空间维度: (B, N, H*W)
+        flatten_response = masked_response.flatten(2)
 
-        # 计算重心: sum(coord * weight) / sum(weight)
-        # visual_masks 是 0/1 或者是 float 的权重
-        cx = (visual_masks * x_grid).sum(dim=[-1, -2]) / mask_sum
-        cy = (visual_masks * y_grid).sum(dim=[-1, -2]) / mask_sum
+        # 4. 找到最大响应值的索引 (Argmax)
+        # max_idx: (B, N) - 每个 mask 内部最强点的索引 (0 ~ H*W-1)
+        max_val, max_idx = flatten_response.max(dim=-1)
+
+        # 5. 将索引转换为 (x, y) 坐标
+        # y = idx // W, x = idx % W
+        ref_y = max_idx // W
+        ref_x = max_idx % W
 
         # 归一化到 [0, 1]
-        # 注意: x 对应 W, y 对应 H
-        cx_norm = cx / W
-        cy_norm = cy / H
+        # +0.5 是为了取像素中心，更精确
+        ref_y_norm = (ref_y.float() + 0.5) / H
+        ref_x_norm = (ref_x.float() + 0.5) / W
 
-        # 堆叠 -> (B, N, 2) -> (B, N, 1, 2) (1 代表 num_levels 维度广播)
-        ref_points = torch.stack([cx_norm, cy_norm], dim=-1).unsqueeze(2)
+        # 堆叠参考点: (B, N, 1, 2) -> (x, y)
+        ref_points = torch.stack([ref_x_norm, ref_y_norm], dim=-1).unsqueeze(2)
 
-        # 截断到有效范围，防止 NaN 或越界
-        return ref_points.clamp(0.01, 0.99)
+        # ---------------------------------------------------------
+        # 6. 获取 Query Init: 使用参考点处的特征，而不是全局平均
+        # ---------------------------------------------------------
+        # grid_sample 需要坐标在 [-1, 1] 之间
+        # ref_points 是 [0, 1]，转换公式: grid = points * 2 - 1
+        sampling_grid = ref_points.squeeze(2).unsqueeze(1) * 2 - 1  # (B, 1, N, 2)
+
+        # 采样特征: (B, C, 1, N)
+        # align_corners=False 与上面的 +0.5 逻辑对应
+        sampled_feat = F.grid_sample(p3_feat, sampling_grid, align_corners=False, mode='bilinear')
+
+        # 调整形状: (B, C, 1, N) -> (B, C, N) -> (B, N, C)
+        query_init = sampled_feat.squeeze(2).permute(0, 2, 1)
+
+        return ref_points.clamp(0.01, 0.99), query_init
 
     def forward(self, x, vp):
         """
-        Args:
-            x (list[Tensor]): [P3, P4, P5]
-            vp (Tensor): Visual Masks (B, N, H, W) - 对应 P3 分辨率
-        Returns:
-            out (Tensor): (B, N, embed_dims)
+        x: [P3, P4, P5]
+        vp: Visual Masks
         """
         # x[0] 是 P3, 形状 (B, C0, H, W)
         B, N, H, W = vp.shape
 
         # -----------------------------------------------------------
-        # 1. 准备 Multi-scale Key/Value
+        # 1. 准备 Multi-scale Key/Value (保持不变)
         # -----------------------------------------------------------
         src_flattens = []
         spatial_shapes = []
-
         for idx, feat in enumerate(x):
-            # 投影到 embed_dims
-            src = self.input_projs[idx](feat)  # (B, C, H_i, W_i)
+            src = self.input_projs[idx](feat)
             bs, c, h_i, w_i = src.shape
             spatial_shapes.append((h_i, w_i))
-
-            # Flatten: (B, H_i*W_i, C)
             src = src.flatten(2).transpose(1, 2)
-
-            # 加上 Level Embedding (区分 P3, P4, P5)
             src = src + self.level_embeds[idx].view(1, 1, -1)
             src_flattens.append(src)
 
-        # 拼接所有层特征: (B, Sum_HW, C)
         src_flattens = torch.cat(src_flattens, 1)
-
-        # 构建 MSDA 需要的 spatial_shapes 和 level_start_index
         spatial_shapes = torch.tensor(spatial_shapes, device=vp.device, dtype=torch.long)
         level_start_index = torch.cat((spatial_shapes.new_zeros((1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
 
         # -----------------------------------------------------------
-        # 2. 初始化 Query (Content-Aware Initialization)
+        # 2. 改进的初始化逻辑 (替换了原来的 Mask Pooling)
         # -----------------------------------------------------------
-        # 使用 Mask 在 P3 特征上做加权平均，作为 Query 的初始值
-        # 相比 SAVPE，我们这里只用 P3 做初始化，依靠 Attention 去看 P4/P5
+        p3_feat = x[0]
+        p3_proj = self.query_init_proj(p3_feat)  # (B, C, H, W)
 
-        p3_feat = x[0]  # (B, C_in, H, W)
-        p3_proj = self.query_init_proj(p3_feat)  # (B, C_embed, H, W)
-
-        # Mask Pooling
-        # vp: (B, N, H, W) -> (B, N, 1, H, W)
-        vp_expanded = vp.unsqueeze(2)
-        # p3: (B, C, H, W) -> (B, 1, C, H, W)
-        p3_expanded = p3_proj.unsqueeze(1)
-
-        mask_sum = vp_expanded.sum(dim=[-1, -2]) + 1e-6
-        # Sum Pooling -> (B, N, C)
-        query_init = (p3_expanded * vp_expanded).sum(dim=[-1, -2]) / mask_sum
+        # 同时获取 参考点 和 初始Query (使用 Argmax 逻辑)
+        reference_points, query_init = self.get_reference_points_and_query(vp, p3_proj)
 
         # -----------------------------------------------------------
-        # 3. 准备 Reference Points
+        # 3. Deformable Attention (保持不变)
         # -----------------------------------------------------------
-        reference_points = self.get_reference_points(vp)  # (B, N, 1, 2)
-
-        # -----------------------------------------------------------
-        # 4. Deformable Attention Cross-Interaction
-        # -----------------------------------------------------------
-        # query: (B, N, C)
-        # value: (B, Sum_HW, C)
         query_interact = self.cross_attn(
             query=query_init,
             value=src_flattens,
@@ -1205,18 +1401,9 @@ class DeformablePromptEncoder(BaseModule):
             level_start_index=level_start_index
         )
 
-        # Residual + Norm
         query_out = self.norm1(query_init + query_interact)
-
-        # -----------------------------------------------------------
-        # 5. FFN
-        # -----------------------------------------------------------
         query_final = self.norm2(query_out + self.ffn(query_out))
 
-        # Output: (B, N, 512)
-        # 这里的 N 就是 mask 的通道数，不需要 reshape 操作
-        # 且我们使用了 L2 Norm 在外部 Hook 做，这里保持 raw feature 即可
-        # 如果需要保持和 SAVPE 完全一致的输出分布，可以在这里加 F.normalize
         return F.normalize(query_final, dim=-1, p=2)
 
 

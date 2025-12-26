@@ -131,100 +131,100 @@ class RandomLoadText:
                     retaged_instances.append(inst)
             results['instances'] = retaged_instances
 
-        # texts = []
-        # for label in sampled_labels:
-        #     cls_caps = class_texts[label]
-        #     assert len(cls_caps) > 0
-        #     cap_id = random.randrange(len(cls_caps))
-        #     sel_cls_cap = self.prompt_format.format(cls_caps[cap_id])
-        #     texts.append(sel_cls_cap)
-        #
-        # if self.padding_to_max:
-        #     num_valid_labels = len(positive_labels) + len(negative_labels)
-        #     num_padding = self.max_num_samples - num_valid_labels
-        #     if num_padding > 0:
-        #         texts += [self.padding_value] * num_padding
-        #
-        # results['texts'] = texts]
-
-        txt_feats_list = []
+        texts = []
         for label in sampled_labels:
             cls_caps = class_texts[label]
             assert len(cls_caps) > 0
-
-            #随机选择一个描述
             cap_id = random.randrange(len(cls_caps))
-            selected_text = cls_caps[cap_id]
+            sel_cls_cap = self.prompt_format.format(cls_caps[cap_id])
+            texts.append(sel_cls_cap)
 
-            key = selected_text.strip()
-            if key in self.train_label_embeddings:
-                txt_feats_list.append(self.train_label_embeddings[key])
-            else:
-                # --- 缺失处理 ---
-                embedding_dim = self.global_grounding_neg_embeddings.shape[1]
-                zero_embedding = torch.zeros(embedding_dim)
-                txt_feats_list.append(zero_embedding)
-
-                # 【修改 3】多进程安全的写入逻辑
-                # 先检查内存中的 set，避免同一进程重复 IO
-                if key not in self._logged_missing_keys:
-                    try:
-                        # 动态获取当前进程专属的文件路径
-                        log_file_path = self._get_unique_log_path()
-
-                        # 追加写入
-                        with open(log_file_path, 'a', encoding='utf-8') as f:
-                            f.write(f"{key}\n")
-
-                        # 标记为已记录
-                        self._logged_missing_keys.add(key)
-
-                        # 仅在主进程打印 Warning，防止日志爆炸
-                        # (可选: 也可以全打印，看你调试需求)
-                        # print(f"Warning: Missing key '{key}' logged to {log_file_path}")
-
-                    except Exception as e:
-                        # 捕获异常防止卡死训练
-                        print(f"Error writing to log file: {e}")
-
-        # 堆叠成 Tensor (N, Dim)
-        if len(txt_feats_list) > 0:
-            txt_feats = torch.stack(txt_feats_list, dim=0)
-        else:
-            # 极端情况：没有样本
-            print(f"出现了该张图片中没有样本的情况")
-            embedding_dim = self.global_grounding_neg_embeddings.shape[1]
-            txt_feats = torch.zeros((0, embedding_dim))
-
-        # ------------------------------------------------------
-        # 核心修改：Padding (使用全局负样本池)
-        # 这里使用了负样本，而不是像yoloworld直接使用空格做填补
-        # ------------------------------------------------------
         if self.padding_to_max:
-            num_valid_labels = txt_feats.shape[0]
+            num_valid_labels = len(positive_labels) + len(negative_labels)
             num_padding = self.max_num_samples - num_valid_labels
-
             if num_padding > 0:
-                # 从全局负样本池中随机采样
-                global_neg_len = self.global_grounding_neg_embeddings.shape[0]
+                texts += [self.padding_value] * num_padding
 
-                # 随机选择索引
-                pad_indices = np.random.choice(
-                    global_neg_len,
-                    size=num_padding,
-                    replace=(num_padding > global_neg_len)  # 如果需要填补的比池子还大，就允许重复
-                )
+        results['texts'] = texts
 
-                # 获取对应的 Embeddings
-                pad_embeddings = self.global_grounding_neg_embeddings[pad_indices]
-
-                # 拼接到结果后面
-                txt_feats = torch.cat((txt_feats, pad_embeddings), dim=0)
-
-        # 最终将 Tensor 赋值给 results['texts']
-        # 注意：后续的 Pipeline (如 PackDetInputs) 需要能够处理 texts 是 Tensor 的情况
-        # 或者你在 PackDetInputs 里把这个 Tensor 放到 data_samples.texts 里面
-        results['texts'] = txt_feats
+        # txt_feats_list = []
+        # for label in sampled_labels:
+        #     cls_caps = class_texts[label]
+        #     assert len(cls_caps) > 0
+        #
+        #     #随机选择一个描述
+        #     cap_id = random.randrange(len(cls_caps))
+        #     selected_text = cls_caps[cap_id]
+        #
+        #     key = selected_text.strip()
+        #     if key in self.train_label_embeddings:
+        #         txt_feats_list.append(self.train_label_embeddings[key])
+        #     else:
+        #         # --- 缺失处理 ---
+        #         embedding_dim = self.global_grounding_neg_embeddings.shape[1]
+        #         zero_embedding = torch.zeros(embedding_dim)
+        #         txt_feats_list.append(zero_embedding)
+        #
+        #         # 【修改 3】多进程安全的写入逻辑
+        #         # 先检查内存中的 set，避免同一进程重复 IO
+        #         if key not in self._logged_missing_keys:
+        #             try:
+        #                 # 动态获取当前进程专属的文件路径
+        #                 log_file_path = self._get_unique_log_path()
+        #
+        #                 # 追加写入
+        #                 with open(log_file_path, 'a', encoding='utf-8') as f:
+        #                     f.write(f"{key}\n")
+        #
+        #                 # 标记为已记录
+        #                 self._logged_missing_keys.add(key)
+        #
+        #                 # 仅在主进程打印 Warning，防止日志爆炸
+        #                 # (可选: 也可以全打印，看你调试需求)
+        #                 # print(f"Warning: Missing key '{key}' logged to {log_file_path}")
+        #
+        #             except Exception as e:
+        #                 # 捕获异常防止卡死训练
+        #                 print(f"Error writing to log file: {e}")
+        #
+        # # 堆叠成 Tensor (N, Dim)
+        # if len(txt_feats_list) > 0:
+        #     txt_feats = torch.stack(txt_feats_list, dim=0)
+        # else:
+        #     # 极端情况：没有样本
+        #     print(f"出现了该张图片中没有样本的情况")
+        #     embedding_dim = self.global_grounding_neg_embeddings.shape[1]
+        #     txt_feats = torch.zeros((0, embedding_dim))
+        #
+        # # ------------------------------------------------------
+        # # 核心修改：Padding (使用全局负样本池)
+        # # 这里使用了负样本，而不是像yoloworld直接使用空格做填补
+        # # ------------------------------------------------------
+        # if self.padding_to_max:
+        #     num_valid_labels = txt_feats.shape[0]
+        #     num_padding = self.max_num_samples - num_valid_labels
+        #
+        #     if num_padding > 0:
+        #         # 从全局负样本池中随机采样
+        #         global_neg_len = self.global_grounding_neg_embeddings.shape[0]
+        #
+        #         # 随机选择索引
+        #         pad_indices = np.random.choice(
+        #             global_neg_len,
+        #             size=num_padding,
+        #             replace=(num_padding > global_neg_len)  # 如果需要填补的比池子还大，就允许重复
+        #         )
+        #
+        #         # 获取对应的 Embeddings
+        #         pad_embeddings = self.global_grounding_neg_embeddings[pad_indices]
+        #
+        #         # 拼接到结果后面
+        #         txt_feats = torch.cat((txt_feats, pad_embeddings), dim=0)
+        #
+        # # 最终将 Tensor 赋值给 results['texts']
+        # # 注意：后续的 Pipeline (如 PackDetInputs) 需要能够处理 texts 是 Tensor 的情况
+        # # 或者你在 PackDetInputs 里把这个 Tensor 放到 data_samples.texts 里面
+        # results['texts'] = txt_feats
 
         return results
 
