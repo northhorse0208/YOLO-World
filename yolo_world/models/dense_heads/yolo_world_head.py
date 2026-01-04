@@ -175,7 +175,7 @@ class YOLOWorldHeadModule(YOLOv8HeadModule):
         self.reg_preds = nn.ModuleList()
         self.cls_contrasts = nn.ModuleList()
         #self.savpe = SAVPE(in_channels=[256, 512, 512], hidden_channels=256, embed_dims=512)
-        self.savpe = DeformablePromptEncoder()
+        self.savpe = DeformablePromptEncoder(in_channels=self.in_channels)
         self.opr_fusion = OrthogonalFusionModule(embed_dims=self.embed_dims)
 
         reg_out_channels = max(
@@ -286,7 +286,7 @@ class YOLOWorldHeadModule(YOLOv8HeadModule):
         # visual_embeds: (B, N, 512)
         if visual_masks.shape[-1] == 80:
             visual_embeds = self.savpe(img_feats, visual_masks)
-        elif visual_masks.shape[-1] == 512:
+        elif visual_masks.shape[-1] == 512: #验证的时候走这个
             visual_embeds = visual_masks
         else:
             raise ValueError('shape fault')

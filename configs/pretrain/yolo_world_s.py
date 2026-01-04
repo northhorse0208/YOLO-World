@@ -1,5 +1,5 @@
 _base_ = ('../../third_party/mmyolo/configs/yolov8/'
-          'yolov8_l_syncbn_fast_8xb16-500e_coco.py')
+          'yolov8_s_syncbn_fast_8xb16-500e_coco.py')
 custom_imports = dict(imports=['yolo_world', 'yolo_world.hooks'],
                       allow_failed_imports=False)
 
@@ -263,8 +263,8 @@ text_channels = 512
 neck_embed_channels = [128, 256, _base_.last_stage_out_channels // 2]
 neck_num_heads = [4, 8, _base_.last_stage_out_channels // 2 // 32]
 #base_lr = 2e-3
-base_lr = 2e-5
-#base_lr = 2e-5
+# base_lr = 2e-5
+base_lr = 2e-4
 weight_decay = 0.05 / 2
 train_batch_size_per_gpu = 8
 # text_model_name = '../pretrained_models/clip-vit-base-patch32-projection'
@@ -356,57 +356,57 @@ train_pipeline = [
 ]
 train_pipeline_stage2 = [*_base_.train_pipeline_stage2[:-1], *text_transform]
 
-obj365v1_train_dataset = dict(
-    type='MultiModalDataset',
-    dataset=dict(
-        type='YOLOv5Objects365V1Dataset',
-        data_root='../../datasets/Objects365v1',
-        ann_file='annotations/objects365_train.json',
-        data_prefix=dict(img='images/train/'),
-        filter_cfg=dict(filter_empty_gt=False, min_size=32)),
-    class_text_path='data/texts/obj365v1_class_texts.json',
-    pipeline=train_pipeline)
-
-mg_train_dataset = dict(type='YOLOv5MixedGroundingDataset',
-                        data_root='../../../dataset/GQA/',
-                        ann_file='final_mixed_train_no_coco.json',
-                        data_prefix=dict(img='images/'),
-                        filter_cfg=dict(filter_empty_gt=False, min_size=32),
-                        pipeline=train_pipeline)
-
-flickr_train_dataset = dict(
-    type='YOLOv5MixedGroundingDataset',
-    data_root='../../../dataset/flickr 30k/',
-    ann_file='final_flickr_separateGT_train.json',
-    data_prefix=dict(img='flickr30k-images/'),
-    filter_cfg=dict(filter_empty_gt=True, min_size=32),
-    pipeline=train_pipeline)
-
 # obj365v1_train_dataset = dict(
 #     type='MultiModalDataset',
 #     dataset=dict(
 #         type='YOLOv5Objects365V1Dataset',
-#         data_root='../../datasets/Objects365v1/object365v1_sampled/sampling_ratio_0.001',
-#         ann_file='annotations/objects365_train_sampled_0.10%.json',
-#         data_prefix=dict(img='images/'),
+#         data_root='../../datasets/Objects365v1',
+#         ann_file='annotations/objects365_train.json',
+#         data_prefix=dict(img='images/train/'),
 #         filter_cfg=dict(filter_empty_gt=False, min_size=32)),
 #     class_text_path='data/texts/obj365v1_class_texts.json',
 #     pipeline=train_pipeline)
 #
 # mg_train_dataset = dict(type='YOLOv5MixedGroundingDataset',
-#                         data_root='../../../dataset/GQA/gqa_sampled/sampling_ratio_0.001/',
-#                         ann_file='annotations/final_mixed_train_no_coco_sampled_0.10%.json',
+#                         data_root='../../../dataset/GQA/',
+#                         ann_file='final_mixed_train_no_coco.json',
 #                         data_prefix=dict(img='images/'),
 #                         filter_cfg=dict(filter_empty_gt=False, min_size=32),
 #                         pipeline=train_pipeline)
 #
 # flickr_train_dataset = dict(
 #     type='YOLOv5MixedGroundingDataset',
-#     data_root='../../../dataset/flickr 30k/flickr_sampled/sampling_ratio_0.001/',
-#     ann_file='annotations/final_flickr_separateGT_train_sampled_0.10%.json',
-#     data_prefix=dict(img='images/'),
+#     data_root='../../../dataset/flickr 30k/',
+#     ann_file='final_flickr_separateGT_train.json',
+#     data_prefix=dict(img='flickr30k-images/'),
 #     filter_cfg=dict(filter_empty_gt=True, min_size=32),
 #     pipeline=train_pipeline)
+
+obj365v1_train_dataset = dict(
+    type='MultiModalDataset',
+    dataset=dict(
+        type='YOLOv5Objects365V1Dataset',
+        data_root='../../datasets/Objects365v1/object365v1_sampled/sampling_ratio_0.001',
+        ann_file='annotations/objects365_train_sampled_0.10%.json',
+        data_prefix=dict(img='images/'),
+        filter_cfg=dict(filter_empty_gt=False, min_size=32)),
+    class_text_path='data/texts/obj365v1_class_texts.json',
+    pipeline=train_pipeline)
+
+mg_train_dataset = dict(type='YOLOv5MixedGroundingDataset',
+                        data_root='../../../dataset/GQA/gqa_sampled/sampling_ratio_0.001/',
+                        ann_file='annotations/final_mixed_train_no_coco_sampled_0.10%.json',
+                        data_prefix=dict(img='images/'),
+                        filter_cfg=dict(filter_empty_gt=False, min_size=32),
+                        pipeline=train_pipeline)
+
+flickr_train_dataset = dict(
+    type='YOLOv5MixedGroundingDataset',
+    data_root='../../../dataset/flickr 30k/flickr_sampled/sampling_ratio_0.001/',
+    ann_file='annotations/final_flickr_separateGT_train_sampled_0.10%.json',
+    data_prefix=dict(img='images/'),
+    filter_cfg=dict(filter_empty_gt=True, min_size=32),
+    pipeline=train_pipeline)
 
 train_dataloader = dict(batch_size=train_batch_size_per_gpu,
                         collate_fn=dict(type='yolow_collate'),
@@ -665,7 +665,7 @@ optim_wrapper = dict(
             'logit_scale': dict(lr_mult=0.0),
 
             # 5. Head 部分学习率乘以0.1
-            'bbox_head': dict(lr_mult=0.1),
+            'bbox_head': dict(lr_mult=0.0),
 
             # 6. [核心] 唯独解冻 SAVPE
             # 这里的 key 必须写得比 'bbox_head' 更长、更具体，以触发最长匹配原则
@@ -729,7 +729,8 @@ optim_wrapper = dict(
 #load_from = 'work_dirs/finetune_deformable_contrast_fuse_fromofficialyoloworld_val_minival/epoch_2.pth'
 #load_from = '/data/codes/WangShuo/py_project/YOLO-World-research/YOLO-World/work_dirs/finetune_contrast_fusev2_fromofficialyoloworld_val_minival/20251216_213704/epoch_1.pth'
 #load_from = 'work_dirs/finetune_deformablev2_only_load_officialmodel_lr2e-4_close_mosaic_5epoch/20251224_000816/epoch_3.pth'
-load_from = '/data/codes/WangShuo/py_project/YOLO-World-research/YOLO-World/work_dirs/finetune_deformablev2_fusev2_lr2e-4_close_mosaic_5epoch/20251225_110513/epoch_5.pth'
+#load_from = '/data/codes/WangShuo/py_project/YOLO-World-research/YOLO-World/work_dirs/finetune_deformablev2_fusev2_lr2e-4_close_mosaic_5epoch/20251225_110513/epoch_5.pth'
+load_from = '/data/codes/WangShuo/py_project/YOLO-World-research/YOLO-World/official_pretraind_models/yolo-world-s-640.pth'
 
 model_wrapper_cfg = dict(
     type='MMDistributedDataParallel',

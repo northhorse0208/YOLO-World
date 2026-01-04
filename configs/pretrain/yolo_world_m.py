@@ -1,5 +1,5 @@
 _base_ = ('../../third_party/mmyolo/configs/yolov8/'
-          'yolov8_l_syncbn_fast_8xb16-500e_coco.py')
+          'yolov8_m_syncbn_fast_8xb16-500e_coco.py')
 custom_imports = dict(imports=['yolo_world', 'yolo_world.hooks'],
                       allow_failed_imports=False)
 
@@ -263,8 +263,8 @@ text_channels = 512
 neck_embed_channels = [128, 256, _base_.last_stage_out_channels // 2]
 neck_num_heads = [4, 8, _base_.last_stage_out_channels // 2 // 32]
 #base_lr = 2e-3
-base_lr = 2e-5
-#base_lr = 2e-5
+# base_lr = 2e-5
+base_lr = 2e-4
 weight_decay = 0.05 / 2
 train_batch_size_per_gpu = 8
 # text_model_name = '../pretrained_models/clip-vit-base-patch32-projection'
@@ -665,7 +665,7 @@ optim_wrapper = dict(
             'logit_scale': dict(lr_mult=0.0),
 
             # 5. Head 部分学习率乘以0.1
-            'bbox_head': dict(lr_mult=0.1),
+            'bbox_head': dict(lr_mult=0.0),
 
             # 6. [核心] 唯独解冻 SAVPE
             # 这里的 key 必须写得比 'bbox_head' 更长、更具体，以触发最长匹配原则
@@ -679,46 +679,46 @@ optim_wrapper = dict(
 
 
 #第二阶段，融合模块1.0，图像提示0.1，head冻住
-# optim_wrapper = dict(
-#     optimizer=dict(
-#         _delete_=True,
-#         type='AdamW',
-#         lr=base_lr,
-#         weight_decay=weight_decay,
-#         batch_size_per_gpu=train_batch_size_per_gpu),
-#
-#     # [核心修改] 参数级精细化配置
-#     paramwise_cfg=dict(
-#         bias_decay_mult=0.0,
-#         norm_decay_mult=0.0,
-#
-#         # custom_keys 字典：键是参数名的一部分，值是配置
-#         custom_keys={
-#             # 1. 冻结 Backbone (包含 Image Encoder)
-#             'backbone': dict(lr_mult=0.0),
-#
-#             # 2. 冻结 Text Encoder (CLIP)
-#             'text_model': dict(lr_mult=0.0),
-#
-#             # 3. 冻结 Neck (PAFPN)
-#             'neck': dict(lr_mult=0.0),
-#
-#             # 4. 冻结 Logit Scale (温度系数)
-#             'logit_scale': dict(lr_mult=0.0),
-#
-#             # 5. Head 部分学习率乘以0.1
-#             'bbox_head': dict(lr_mult=0.0),
-#
-#             # 6. [核心] 唯独解冻 SAVPE
-#             # 这里的 key 必须写得比 'bbox_head' 更长、更具体，以触发最长匹配原则
-#             # 参数的全名通常是: bbox_head.head_module.savpe.xxx
-#             'bbox_head.head_module.savpe': dict(lr_mult=0.1, decay_mult=1.0),
-#             'bbox_head.head_module.opr_fusion': dict(lr_mult=1.0, decay_mult=1.0),
-#             'bbox_head.head_module.opr_fusion.visual_adapter': dict(lr_mult=0.1, decay_mult=1.0),
-#         }
-#     ),
-#     constructor='YOLOWv5OptimizerConstructor'
-# )
+optim_wrapper = dict(
+    optimizer=dict(
+        _delete_=True,
+        type='AdamW',
+        lr=base_lr,
+        weight_decay=weight_decay,
+        batch_size_per_gpu=train_batch_size_per_gpu),
+
+    # [核心修改] 参数级精细化配置
+    paramwise_cfg=dict(
+        bias_decay_mult=0.0,
+        norm_decay_mult=0.0,
+
+        # custom_keys 字典：键是参数名的一部分，值是配置
+        custom_keys={
+            # 1. 冻结 Backbone (包含 Image Encoder)
+            'backbone': dict(lr_mult=0.0),
+
+            # 2. 冻结 Text Encoder (CLIP)
+            'text_model': dict(lr_mult=0.0),
+
+            # 3. 冻结 Neck (PAFPN)
+            'neck': dict(lr_mult=0.0),
+
+            # 4. 冻结 Logit Scale (温度系数)
+            'logit_scale': dict(lr_mult=0.0),
+
+            # 5. Head 部分学习率乘以0.1
+            'bbox_head': dict(lr_mult=0.0),
+
+            # 6. [核心] 唯独解冻 SAVPE
+            # 这里的 key 必须写得比 'bbox_head' 更长、更具体，以触发最长匹配原则
+            # 参数的全名通常是: bbox_head.head_module.savpe.xxx
+            'bbox_head.head_module.savpe': dict(lr_mult=0.1, decay_mult=1.0),
+            'bbox_head.head_module.opr_fusion': dict(lr_mult=1.0, decay_mult=1.0),
+            'bbox_head.head_module.opr_fusion.visual_adapter': dict(lr_mult=0.1, decay_mult=1.0),
+        }
+    ),
+    constructor='YOLOWv5OptimizerConstructor'
+)
 
 
 
@@ -729,7 +729,9 @@ optim_wrapper = dict(
 #load_from = 'work_dirs/finetune_deformable_contrast_fuse_fromofficialyoloworld_val_minival/epoch_2.pth'
 #load_from = '/data/codes/WangShuo/py_project/YOLO-World-research/YOLO-World/work_dirs/finetune_contrast_fusev2_fromofficialyoloworld_val_minival/20251216_213704/epoch_1.pth'
 #load_from = 'work_dirs/finetune_deformablev2_only_load_officialmodel_lr2e-4_close_mosaic_5epoch/20251224_000816/epoch_3.pth'
-load_from = '/data/codes/WangShuo/py_project/YOLO-World-research/YOLO-World/work_dirs/finetune_deformablev2_fusev2_lr2e-4_close_mosaic_5epoch/20251225_110513/epoch_5.pth'
+#load_from = '/data/codes/WangShuo/py_project/YOLO-World-research/YOLO-World/work_dirs/finetune_deformablev2_fusev2_lr2e-4_close_mosaic_5epoch/20251225_110513/epoch_5.pth'
+#load_from = '/data/codes/WangShuo/py_project/YOLO-World-research/YOLO-World/official_pretraind_models/yolo-world-m-640.pth'
+load_from = '/data/codes/WangShuo/py_project/YOLO-World-research/YOLO-World/work_dirs/yolo_world_m_only_deformablev2/20260101_213925/epoch_2.pth'
 
 model_wrapper_cfg = dict(
     type='MMDistributedDataParallel',
